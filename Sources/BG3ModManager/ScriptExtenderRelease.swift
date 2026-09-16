@@ -239,7 +239,9 @@ enum ScriptExtenderRelease {
     // MARK: The GitHub release
 
     /// Fetch the latest release and the asset that contains the dylib.
-    static func latestRelease() async throws -> Release {
+    /// - Parameter store: which store's artifact to pick. Releases carry one
+    ///   asset per store; older releases carry a single unlabelled Steam asset.
+    static func latestRelease(store: GameStore = .steam) async throws -> Release {
         let api = URL(string: "https://api.github.com/repos/\(owner)/\(repo)/releases/latest")!
         var req = URLRequest(url: api)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
@@ -250,15 +252,34 @@ enum ScriptExtenderRelease {
             throw InstallError.releaseLookup(http.statusCode)
         }
 
-        struct Asset: Decodable { let name: String; let browser_download_url: String; let size: Int64 }
+        struct Asset: Decodable, Equatable {
+            let name: String; let browser_download_url: String; let size: Int64
+        }
         struct Payload: Decodable { let tag_name: String; let name: String?; let html_url: String; let assets: [Asset] }
 
         let payload = try JSONDecoder().decode(Payload.self, from: data)
 
-        // Prefer a .zip asset (holds the dylib + INSTALL.txt); accept a bare
-        // .dylib asset if a future release attaches one directly.
-        let asset = payload.assets.first { $0.name.lowercased().hasSuffix(".zip") }
-                 ?? payload.assets.first { $0.name.lowercased().hasSuffix(".dylib") }
+        // Steam and GOG need different artifacts, so match the store's name in
+        // the asset filename first.
+        //
+        // GOG must not fall back to an unlabelled asset: every release before
+        // GOG support was a Steam build, so the fallback would hand a GOG user a
+        // dylib that cannot work. Steam does fall back, since that is what those
+        // older assets are.
+        func pick(_ assets: [Asset], labelled: Bool) -> Asset? {
+            let candidates = labelled
+                ? assets.filter { $0.name.lowercased().contains(store.rawValue) }
+                : assets.filter { asset in
+                    !GameStore.allLabels.contains { asset.name.lowercased().contains($0) }
+                  }
+            return candidates.first { $0.name.lowercased().hasSuffix(".zip") }
+                ?? candidates.first { $0.name.lowercased().hasSuffix(".dylib") }
+        }
+
+        var asset = pick(payload.assets, labelled: true)
+        if asset == nil, store == .steam {
+            asset = pick(payload.assets, labelled: false)
+        }
         guard let asset, let url = URL(string: asset.browser_download_url) else {
             throw InstallError.noAsset(payload.tag_name)
         }
@@ -284,7 +305,7 @@ enum ScriptExtenderRelease {
         var errorDescription: String? {
             switch self {
             case .noGameApp:
-                return "Couldn't find Baldur's Gate 3.app. Set the game path in Settings, or install through Steam first."
+                return "Couldn't find Baldur's Gate 3.app. Set the game path in Settings, or install the game first (Steam or GOG)."
             case .releaseLookup(let code):
                 return "Couldn't reach the BG3SE-macOS releases (HTTP \(code)). Check your connection."
             case .noAsset(let tag):
@@ -316,8 +337,14 @@ enum ScriptExtenderRelease {
     static func installLatest(gameApp: URL,
                               release known: Release? = nil,
                               log: @escaping (String) -> Void) async throws -> InstallResult {
+        let store = GameStore.detect(in: gameApp)
         let release: Release
-        if let known { release = known } else { release = try await latestRelease() }
+        if let known {
+            release = known
+        } else {
+            log("Installed game is the \(store.displayName) build.")
+            release = try await latestRelease(store: store)
+        }
         log("Latest release: \(release.name) (\(release.tag))")
         log("Downloading \(release.assetName)…")
 
@@ -364,7 +391,8 @@ enum ScriptExtenderRelease {
         let state = inspect(gameApp: gameApp)
         if state.isReady {
             log("")
-            log("Done. Launch Baldur's Gate 3 through Steam; it loads the extender on its own.")
+            let store = GameStore.detect(in: gameApp)
+            log("Done. Launch Baldur's Gate 3 through \(store.displayName); it loads the extender on its own.")
             log("Targets game build \(targetGameBuild) — the extender idles on any other build.")
         }
         return InstallResult(state: state, release: release)

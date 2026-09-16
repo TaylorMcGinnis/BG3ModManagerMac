@@ -4,10 +4,14 @@ import Foundation
 ///
 /// This is a different mechanism from the Windows SE the app installs into a CrossOver bottle. There
 /// is no DLL and nothing is copied into the game folder: BG3SE-macOS builds `libbg3se.dylib` from
-/// source and loads it by wrapping the game's launch command, which is set in Steam's launch options
-/// as `…/scripts/bg3w.sh %command%`. Nothing to install into the Mods folder, and nothing this app
-/// can copy into place — so its job here is to find the checkout, report exactly which of the three
-/// steps (cloned / built / wired into Steam) is done, and hand over the command to finish it.
+/// source and loads it by wrapping the game's launch command. Nothing to install into the Mods
+/// folder, and nothing this app can copy into place — so its job here is to find the checkout,
+/// report exactly which of the three steps (cloned / built / wired up) is done, and hand over the
+/// command to finish it.
+///
+/// The last two steps depend on the store: Steam and GOG need different builds (`-DBG3_STORE`) and
+/// different launchers (`bg3w.sh` via Steam's launch options, `bg3g.sh` via Galaxy's custom
+/// executable).
 ///
 /// Project: https://github.com/mageweaver/bg3se-macos
 enum ScriptExtenderMac {
@@ -17,27 +21,35 @@ enum ScriptExtenderMac {
     /// A BG3SE-macOS checkout and how far along its setup is.
     struct Installation: Equatable {
         var root: URL
-        /// `scripts/bg3w.sh` — the launcher Steam has to be pointed at.
+        /// Which store's build this targets. Steam unless a GOG bundle was found.
+        var store: GameStore = .steam
+        /// The launcher for this store: `scripts/bg3w.sh` or `scripts/bg3g.sh`.
         var launchScript: URL?
-        /// `build/lib/libbg3se.dylib` — present only once the project has been built.
+        /// `build/lib/libbg3se.dylib` (or `build-gog/…`), present once built for
+        /// this store. A Steam build does not count as a GOG one — the extender
+        /// disables itself on mismatched addresses.
         var dylib: URL?
         var dylibBuiltAt: Date?
         var dylibBytes: Int64 = 0
         var isUniversal = false
-        /// True when Steam's stored launch options already reference the launcher.
-        var wiredIntoSteam = false
+        /// True when the store's launcher is wired up: Steam's launch options,
+        /// or Galaxy's custom executable.
+        var isWired = false
 
         var isBuilt: Bool { dylib != nil }
-        var isReady: Bool { isBuilt && launchScript != nil && wiredIntoSteam }
+        var isReady: Bool { isBuilt && launchScript != nil && isWired }
 
         /// What the user pastes into Steam → BG3 → Properties → Launch Options.
+        /// Steam only — Galaxy takes an executable, not a command line. See
+        /// `GalaxyLaunchOptions`.
         var launchOptions: String? {
-            launchScript.map { "\($0.path) %command%" }
+            guard store == .steam else { return nil }
+            return launchScript.map { "\($0.path) %command%" }
         }
 
         var stage: Stage {
             if !isBuilt { return .notBuilt }
-            if !wiredIntoSteam { return .notWired }
+            if !isWired { return .notWired }
             return .ready
         }
 
@@ -56,28 +68,40 @@ enum ScriptExtenderMac {
     }
 
     /// Locate a usable checkout: the configured path first, then the usual spots.
-    static func discover(configuredPath: String) -> Installation? {
-        if !configuredPath.isEmpty, let found = inspect(URL(fileURLWithPath: configuredPath)) {
+    ///
+    /// `gameApp` decides which store's build and launcher to look for; nil
+    /// assumes Steam.
+    static func discover(configuredPath: String, gameApp: URL? = nil) -> Installation? {
+        let store = gameApp.map(GameStore.detect(in:)) ?? .steam
+        if !configuredPath.isEmpty,
+           let found = inspect(URL(fileURLWithPath: configuredPath), store: store, gameApp: gameApp) {
             return found
         }
         for root in searchRoots {
-            if let found = inspect(root) { return found }
+            if let found = inspect(root, store: store, gameApp: gameApp) { return found }
         }
         return nil
     }
 
     /// Read the state of a folder claimed to be a BG3SE-macOS checkout. Returns nil if it plainly
     /// isn't one — the launcher script and CMakeLists together are a good enough signature.
-    static func inspect(_ root: URL) -> Installation? {
+    static func inspect(_ root: URL, store: GameStore = .steam,
+                        gameApp: URL? = nil) -> Installation? {
         let fm = FileManager.default
-        let script = root.appendingPathComponent("scripts/bg3w.sh")
+        // bg3w.sh is the signature either way: every checkout has it, while
+        // bg3g.sh only exists in ones new enough to support GOG.
+        let signature = root.appendingPathComponent("scripts/bg3w.sh")
         let cmake = root.appendingPathComponent("CMakeLists.txt")
-        guard fm.fileExists(atPath: script.path) || fm.fileExists(atPath: cmake.path) else { return nil }
+        guard fm.fileExists(atPath: signature.path) || fm.fileExists(atPath: cmake.path) else {
+            return nil
+        }
 
-        var install = Installation(root: root)
+        var install = Installation(root: root, store: store)
+
+        let script = root.appendingPathComponent(store.launcherScriptName)
         if fm.fileExists(atPath: script.path) { install.launchScript = script }
 
-        let dylib = root.appendingPathComponent("build/lib/libbg3se.dylib")
+        let dylib = root.appendingPathComponent("\(store.buildDirectory)/lib/libbg3se.dylib")
         if fm.fileExists(atPath: dylib.path) {
             install.dylib = dylib
             let values = try? dylib.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
@@ -85,7 +109,13 @@ enum ScriptExtenderMac {
             install.dylibBytes = Int64(values?.fileSize ?? 0)
             install.isUniversal = isUniversalBinary(dylib)
         }
-        install.wiredIntoSteam = steamLaunchOptionsReferenceLauncher()
+
+        switch store {
+        case .steam:
+            install.isWired = steamLaunchOptionsReferenceLauncher()
+        case .gog:
+            install.isWired = gameApp.map(GalaxyLaunchOptions.isWired(gameApp:)) ?? false
+        }
         return install
     }
 
@@ -119,12 +149,15 @@ enum ScriptExtenderMac {
     // MARK: Build guidance
 
     /// The commands that produce the dylib, ready to paste into Terminal.
-    static func buildCommands(for root: URL) -> String {
+    ///
+    /// -DBG3_STORE picks the compile-time address tables, and is not optional
+    /// for GOG: a Steam-built dylib disables itself on a GOG install.
+    static func buildCommands(for root: URL, store: GameStore = .steam) -> String {
         """
         cd \(root.path)
         git submodule update --init --recursive
-        mkdir -p build && cd build
-        cmake .. && cmake --build .
+        cmake -B \(store.buildDirectory) -DBG3_STORE=\(store.rawValue)
+        cmake --build \(store.buildDirectory)
         """
     }
 

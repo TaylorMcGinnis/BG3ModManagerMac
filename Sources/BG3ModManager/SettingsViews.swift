@@ -149,11 +149,13 @@ struct ScriptExtenderView: View {
                 case .ready:
                     infoBox(color: .green, icon: "checkmark.seal.fill",
                             title: "Script Extender is set up for the native Mac build",
-                            body: "BG3SE-macOS is built and Steam is launching the game through it. Mods that need the Script Extender work here.")
+                            body: "BG3SE-macOS is built and \(install.store.displayName) is launching the game through it. Mods that need the Script Extender work here.")
                 case .notWired:
                     infoBox(color: .orange, icon: "exclamationmark.triangle.fill",
-                            title: "Built, but Steam isn’t launching through it",
-                            body: "The dylib exists, but BG3’s launch options don’t point at the launcher — so the game starts without the Script Extender. Paste the line below into Steam.")
+                            title: "Built, but \(install.store.displayName) isn’t launching through it",
+                            body: install.store == .steam
+                                ? "The dylib exists, but BG3’s launch options don’t point at the launcher — so the game starts without the Script Extender. Paste the line below into Steam."
+                                : "The dylib exists, but Galaxy isn’t launching the game through it — so the game starts without the Script Extender. Follow the steps below.")
                 case .notBuilt:
                     infoBox(color: .orange, icon: "hammer.fill",
                             title: "Checkout found, but not built yet",
@@ -190,7 +192,9 @@ struct ScriptExtenderView: View {
                 } else {
                     detailRow("Built", "not yet")
                 }
-                detailRow("Steam launch options", install.wiredIntoSteam ? "pointing at the launcher" : "not set")
+                detailRow("Game", install.store.displayName)
+                detailRow(install.store == .steam ? "Steam launch options" : "Galaxy custom executable",
+                          install.isWired ? "pointing at the launcher" : "not set")
             }
             .font(.caption)
             .padding(10)
@@ -198,13 +202,23 @@ struct ScriptExtenderView: View {
             .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
 
             if !install.isBuilt {
-                codeBlock(title: "Build it", text: ScriptExtenderMac.buildCommands(for: install.root))
-            } else if let options = install.launchOptions, !install.wiredIntoSteam {
-                codeBlock(title: "Steam → Baldur’s Gate 3 → Properties → Launch Options",
-                          text: options)
-                Text("Steam only writes launch options to disk when it quits, so this may keep reading “not set” until you restart Steam.")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                codeBlock(title: "Build it",
+                          text: ScriptExtenderMac.buildCommands(for: install.root, store: install.store))
+                if install.store == .gog {
+                    Text("The GOG build is a separate artifact — its addresses differ from the Steam one, and each disables itself against the other’s game.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } else if !install.isWired {
+                if install.store == .steam, let options = install.launchOptions {
+                    codeBlock(title: "Steam → Baldur’s Gate 3 → Properties → Launch Options",
+                              text: options)
+                    Text("Steam only writes launch options to disk when it quits, so this may keep reading “not set” until you restart Steam.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if install.store == .gog, let script = install.launchScript {
+                    galaxySetup(script: script)
+                }
             }
 
             HStack {
@@ -212,13 +226,32 @@ struct ScriptExtenderView: View {
                     Button("Build It Now") { installScriptExtender(into: install.root) }
                         .buttonStyle(.borderedProminent)
                         .disabled(!ScriptExtenderInstaller.checkPrerequisites().ready || state.isInstallingScriptExtender)
-                } else if !install.wiredIntoSteam {
-                    Button("Set Steam Launch Options") { state.wireScriptExtenderIntoSteam() }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(SteamLaunchOptions.isSteamRunning)
-                        .help(SteamLaunchOptions.isSteamRunning
-                              ? "Quit Steam first — it rewrites its config on exit and would discard the change"
-                              : "Write the launcher into BG3's Steam launch options")
+                } else if !install.isWired {
+                    switch install.store {
+                    case .steam:
+                        Button("Set Steam Launch Options") { state.wireScriptExtenderIntoSteam() }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(SteamLaunchOptions.isSteamRunning)
+                            .help(SteamLaunchOptions.isSteamRunning
+                                  ? "Quit Steam first — it rewrites its config on exit and would discard the change"
+                                  : "Write the launcher into BG3's Steam launch options")
+                    case .gog:
+                        // No button: Galaxy owns this setting and reverts an
+                        // external write. Its own UI is the only way that holds.
+                        if let script = install.launchScript {
+                            Button("Copy Launcher Path") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(script.path, forType: .string)
+                                state.statusMessage = "Launcher path copied — paste it into Galaxy’s custom executable field."
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .help("Copy the path to paste into Galaxy → Manage installation → Configure")
+                            Button("Reveal Launcher") {
+                                NSWorkspace.shared.activateFileViewerSelecting([script])
+                            }
+                            .help("Show bg3g.sh in Finder, to pick it in Galaxy’s file chooser")
+                        }
+                    }
                 }
                 Button("Update & Rebuild") { installScriptExtender(into: install.root) }
                     .disabled(state.isInstallingScriptExtender)
@@ -228,11 +261,12 @@ struct ScriptExtenderView: View {
                 Button("Choose Different Folder…") { chooseScriptExtenderFolder() }
             }
             if !install.isBuilt { prerequisites }
-            if install.isBuilt, !install.wiredIntoSteam, SteamLaunchOptions.isSteamRunning {
+            if install.isBuilt, !install.isWired, install.store == .steam, SteamLaunchOptions.isSteamRunning {
                 Label("Steam is running — quit it first, or the change will be overwritten when it exits.",
                       systemImage: "exclamationmark.triangle.fill")
                     .font(.caption).foregroundStyle(.orange)
             }
+
         }
     }
 
@@ -258,6 +292,38 @@ struct ScriptExtenderView: View {
     private func installScriptExtender(into root: URL) {
         showingInstallLog = true
         Task { await state.installScriptExtenderMac(into: root) }
+    }
+
+    /// Setup steps for GOG, shown instead of Steam's paste-in line.
+    ///
+    /// Galaxy has no launch-options field and reverts an externally written
+    /// custom executable, so its own UI is the only route that sticks. The path
+    /// is shown in full because it is what gets pasted or picked.
+    @ViewBuilder
+    private func galaxySetup(script: URL) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Set this up in GOG Galaxy")
+                .font(.caption).bold()
+            ForEach(Array(GalaxyLaunchOptions.setupSteps(launcher: script).enumerated()),
+                    id: \.offset) { index, step in
+                HStack(alignment: .top, spacing: 6) {
+                    Text("\(index + 1).")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Text(step)
+                        .font(.caption)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Text("Galaxy takes an executable, not a command line, so there is nothing to paste into a launch-options box — it has none.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, 2)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
     }
 
     private func detailRow(_ label: String, _ value: String) -> some View {
@@ -346,7 +412,7 @@ struct ScriptExtenderView: View {
                 } else {
                     infoBox(color: .green, icon: "checkmark.seal.fill",
                             title: "Script Extender installed",
-                            body: "libbg3se.dylib is in the game and Gatekeeper-cleared. Launch Baldur's Gate 3 through Steam — it loads the extender on its own.")
+                            body: "libbg3se.dylib is in the game and Gatekeeper-cleared. Launch Baldur's Gate 3 through \(state.scriptExtenderStoreName) — it loads the extender on its own.")
                 }
                 releaseDetails(rel)
                 latestReleaseLine
@@ -392,7 +458,7 @@ struct ScriptExtenderView: View {
                     Button("Releases") { NSWorkspace.shared.open(ScriptExtenderRelease.releasesPage) }
                 }
                 if ScriptExtenderRelease.discoverGameApp() == nil {
-                    Text("Couldn't find Baldur's Gate 3.app. Install the game through Steam first, or set the path in Settings.")
+                    Text("Couldn't find Baldur's Gate 3.app. Install the game first (Steam or GOG), or set the path in Settings.")
                         .font(.callout).foregroundStyle(.secondary)
                 }
             }
@@ -473,7 +539,7 @@ struct ScriptExtenderView: View {
     private var explainer: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Two routes to the Script Extender on a Mac").font(.headline)
-            Text("The Script Extender isn’t a normal mod — it hooks the running game’s internals to expose a Lua scripting layer, so it has to be built for the exact binary it attaches to.\n\nUnder CrossOver you’re running the Windows game, so Norbyte’s Windows SE loads as a DWrite.dll proxy, exactly as it does under Proton.\n\nOn the native Mac build, BG3SE-macOS is a separate project that reimplements the extender against the Mac binary. It ships as a dylib you build yourself and loads by wrapping the game’s launch command in Steam — no DLL, and nothing to place in the Mods folder. Most Windows SE mods work through it, including Mod Configuration Menu and the libraries that hundreds of mods depend on.")
+            Text("The Script Extender isn’t a normal mod — it hooks the running game’s internals to expose a Lua scripting layer, so it has to be built for the exact binary it attaches to.\n\nUnder CrossOver you’re running the Windows game, so Norbyte’s Windows SE loads as a DWrite.dll proxy, exactly as it does under Proton.\n\nOn the native Mac build, BG3SE-macOS is a separate project that reimplements the extender against the Mac binary. It ships as a dylib you build yourself and loads by wrapping the game’s launch command — through Steam’s launch options, or Galaxy’s custom executable on GOG. No DLL, and nothing to place in the Mods folder. Most Windows SE mods work through it, including Mod Configuration Menu and the libraries that hundreds of mods depend on.")
                 .font(.callout).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }

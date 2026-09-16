@@ -132,7 +132,8 @@ final class AppState: ObservableObject {
         }
         // Detect the native Script Extender before publishing the environments: whether an install
         // is SE-capable is baked into GameEnvironment, and the mod list is classified against it.
-        macScriptExtender = ScriptExtenderMac.discover(configuredPath: bg3seMacPath)
+        macScriptExtender = ScriptExtenderMac.discover(configuredPath: bg3seMacPath,
+                                                  gameApp: ScriptExtenderRelease.discoverGameApp())
         macSERelease = ScriptExtenderRelease.inspect(gameApp: ScriptExtenderRelease.discoverGameApp())
         if let root = macScriptExtender?.root, macScriptExtender?.isBuilt == true {
             for index in envs.indices where envs[index].kind == .nativeMac {
@@ -184,11 +185,19 @@ final class AppState: ObservableObject {
         }
         if let install = macScriptExtender {
             statusMessage = install.isBuilt
-                ? "Found BG3SE-macOS at \(install.root.lastPathComponent)\(install.wiredIntoSteam ? " — set up and wired into Steam." : " — built, but Steam launch options aren't set yet.")"
+                ? "Found BG3SE-macOS at \(install.root.lastPathComponent)\(install.isWired ? " — set up and wired into \(install.store.displayName)." : " — built, but \(install.store.displayName) isn't pointed at the launcher yet.")"
                 : "Found BG3SE-macOS at \(install.root.lastPathComponent), but it hasn't been built yet."
         } else {
             statusMessage = "No BG3SE-macOS checkout found there."
         }
+    }
+
+    /// The installed game's storefront, for user-facing text. Defaults to Steam
+    /// when no install is found, which is the historical assumption.
+    var scriptExtenderStoreName: String {
+        (macScriptExtender?.store
+            ?? ScriptExtenderRelease.discoverGameApp().map(GameStore.detect(in:))
+            ?? .steam).displayName
     }
 
     /// Default place to put a fresh checkout when the user hasn't chosen one.
@@ -212,7 +221,10 @@ final class AppState: ObservableObject {
             bg3seMacPath = install.root.path
             refreshScriptExtenderMac()
             scriptExtenderLog.append("")
-            scriptExtenderLog.append("Done. \(install.wiredIntoSteam ? "Steam is already launching through it." : "Next: set the Steam launch options.")")
+            let next = install.store == .steam
+                ? "Next: set the Steam launch options."
+                : "Next: point GOG Galaxy at the launcher — the steps are in the Script Extender tab."
+            scriptExtenderLog.append("Done. \(install.isWired ? "\(install.store.displayName) is already launching through it." : next)")
             statusMessage = "BG3SE-macOS built at \(install.root.path)."
         } catch {
             scriptExtenderLog.append("")
@@ -221,9 +233,15 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Write BG3's launch options into Steam's config so the game starts through the launcher.
+    /// Write BG3's launch options into Steam's config so the game starts
+    /// through the launcher.
+    ///
+    /// Steam only. Galaxy takes an executable rather than a command line, and
+    /// setting it from outside does not hold — see GalaxyLaunchOptions. The GOG
+    /// path is the steps shown in the Script Extender tab.
     func wireScriptExtenderIntoSteam() {
-        guard let options = macScriptExtender?.launchOptions else {
+        guard let install = macScriptExtender, install.store == .steam else { return }
+        guard let options = install.launchOptions else {
             statusMessage = "Build BG3SE-macOS first — there's no launcher to point Steam at."
             return
         }
@@ -263,7 +281,7 @@ final class AppState: ObservableObject {
             macSELatestError = nil
             macSELatestCheckedAt = Date()
             statusMessage = result.state.isReady
-                ? "Script Extender \(result.release.tag) installed. Launch Baldur's Gate 3 through Steam."
+                ? "Script Extender \(result.release.tag) installed. Launch Baldur's Gate 3 through \(scriptExtenderStoreName)."
                 : "Downloaded, but something's off — see the log."
         } catch {
             scriptExtenderLog.append("")
@@ -303,7 +321,8 @@ final class AppState: ObservableObject {
     /// Re-read the Script Extender state — after a build, or after pasting the Steam launch options.
     func refreshScriptExtenderMac() {
         let wasCapable = activeEnvironment?.supportsScriptExtender ?? false
-        macScriptExtender = ScriptExtenderMac.discover(configuredPath: bg3seMacPath)
+        macScriptExtender = ScriptExtenderMac.discover(configuredPath: bg3seMacPath,
+                                                  gameApp: ScriptExtenderRelease.discoverGameApp())
         let selected = activeEnvironment?.id
         bootstrap()
         if let selected, let match = environments.first(where: { $0.id == selected }) {
